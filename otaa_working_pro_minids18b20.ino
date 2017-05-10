@@ -34,7 +34,6 @@
 #include <avr/wdt.h>
 #include <lmic.h>
 #include <hal/hal.h>
-#include <Wire.h>
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -53,8 +52,8 @@ CayenneLPP Payload(MAX_SIZE);
 
 
 #ifdef DS18B20
-OneWire ourWire(ONE_WIRE_BUS); /* Ini oneWire instance*/
-DallasTemperature sensors(&ourWire);/* Dallas Temperature Library fÃ¼r Nutzung der oneWire Library vorbereiten */
+OneWire ds(ONE_WIRE_BUS); /* Ini oneWire instance*/
+
 #endif
 
 
@@ -170,15 +169,17 @@ void onEvent (ev_t ev) {
       if (LMIC.dataLen) {
         // data received in rx slot after tx
         // if any data received, a LED will blink
-        // this number of times, with a maximum of 10
-        Serial.print(F("Data Received: "));
+        // this number of times
+        Serial.print(F("!!!Data Received: "));
         Serial.println(LMIC.frame[LMIC.dataBeg], HEX);
         i = (LMIC.frame[LMIC.dataBeg]);
         // i (0..255) can be used as data for any other application
         // like controlling a relay, showing a display message etc.
-        if (i > 10) {
-          i = 10;   // maximum number of BLINKs
-        }
+        sleepcycles = i;
+
+        if (i > 10)
+          i = 11;
+
         for (j = 0; j < i; j++)
         {
           digitalWrite(LedPin, HIGH);
@@ -186,6 +187,7 @@ void onEvent (ev_t ev) {
           digitalWrite(LedPin, LOW);
           delay(400);
         }
+
       }
       Serial.println(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
       delay(50);  // delay to complete Serial Output before Sleeping
@@ -235,15 +237,81 @@ void do_send(osjob_t* j)
        Serial.println(F("OP_TXRXPEND, not sending"));
     } else */{
     // Prepare upstream data transmission at the next possible time.
+    byte i;
+    byte present = 0;
+    byte type_s;
+    byte data[12];
+    byte addr[8];
+    float celsius, fahrenheit;
 
     float temp;
     int volt;
 
 #ifdef DS18B20
-    
+    ds.reset_search();
+    if ( !ds.search(addr)) {
+      Serial.println("No more addresses.");
+      Serial.println();
+      ds.reset_search();
+      delay(250);
+      return;
+    }
+
+    if (OneWire::crc8(addr, 7) != addr[7]) {
+      Serial.println("CRC is not valid!");
+      return;
+    }
+    switch (addr[0]) {
+      case 0x10:
+        type_s = 1;
+        break;
+      case 0x28:
+        type_s = 0;
+        break;
+      case 0x22:
+        type_s = 0;
+        break;
+      default:
+        Serial.println("Device is not a DS18x20 family device.");
+        return;
+    }
+
+    ds.reset();
+    ds.select(addr);
+    ds.write(0x44, 1);        // start conversion, with parasite power on at the end
+
+    delay(1000);     // maybe 750ms is enough, maybe not
+    // we might do a ds.depower() here, but the reset will take care of it.
+
+    present = ds.reset();
+    ds.select(addr);
+    ds.write(0xBE);         // Read Scratchpad
+
+    for ( i = 0; i < 9; i++) {           // we need 9 bytes
+      data[i] = ds.read();
+
+    }
+
+    int16_t raw = (data[1] << 8) | data[0];
+    if (type_s) {
+      raw = raw << 3; // 9 bit resolution default
+      if (data[7] == 0x10) {
+        // "count remain" gives full 12 bit resolution
+        raw = (raw & 0xFFF0) + 12 - data[6];
+      }
+    } else {
+      byte cfg = (data[4] & 0x60);
+      // at lower res, the low bits are undefined, so let's zero them
+      if (cfg == 0x00) raw = raw & ~7;  // 9 bit resolution, 93.75 ms
+      else if (cfg == 0x20) raw = raw & ~3; // 10 bit res, 187.5 ms
+      else if (cfg == 0x40) raw = raw & ~1; // 11 bit res, 375 ms
+      //// default is 12 bit resolution, 750 ms conversion time
+    }
+    temp = (float)raw / 16.0;
+
     Payload.reset();
+
     // Get temperature event and print its value.
-    temp = sensors.getTempCByIndex(0) - 1.0;
     Serial.print("Grad Celsius: ");
     Serial.println(temp);
     delay(500);
@@ -251,7 +319,7 @@ void do_send(osjob_t* j)
     Serial.print("Spannung: ");
     Serial.println(volt);
     Payload.addTemperature(0, temp);
-    Payload.addAnalogInput(1, (float)volt/100);
+    Payload.addAnalogInput(1, (float)volt / 100);
 
     LMIC_setTxData2(2, Payload.getBuffer(), Payload.getSize(), 0);
     Serial.println(F("Packet queued"));
@@ -262,8 +330,8 @@ void do_send(osjob_t* j)
     temp = 77;
     Payload.addTemperature(0, temp);
     volt = 220;
-    Payload.addAnalogInput(1, volt); 
-    
+    Payload.addAnalogInput(1, volt);
+
     LMIC_setTxData2(2, Payload.getBuffer(), Payload.getSize(), 0);
     Serial.println(F("Packet queued"));
     // Next TX is scheduled after TX_COMPLETE event.
@@ -271,37 +339,6 @@ void do_send(osjob_t* j)
   }
 }
 
-#ifdef DS18B20
-void adresseAusgeben(void) {
-  byte i;
-  byte present = 0;
-  byte data[12];
-  byte addr[8];
-
-  Serial.print("Suche 1-Wire-Devices...\n\r");// "\n\r" is NewLine
-  while (ourWire.search(addr)) {
-    Serial.print("\n\r\n\r1-Wire-Device gefunden mit Adresse:\n\r");
-    for ( i = 0; i < 8; i++) {
-      Serial.print("0x");
-      if (addr[i] < 16) {
-        Serial.print('0');
-      }
-      Serial.print(addr[i], HEX);
-      if (i < 7) {
-        Serial.print(", ");
-      }
-    }
-    if ( OneWire::crc8( addr, 7) != addr[7]) {
-      Serial.print("CRC is not valid!\n\r");
-      return;
-    }
-  }
-  Serial.println();
-  ourWire.reset_search();
-  return;
-}
-
-#endif
 
 void setup()
 {
@@ -317,9 +354,7 @@ void setup()
 #ifdef DS18B20
   Serial.println("Temperatur Messprogramm");
   Serial.println("Starte Temperatur abfragen ...");
-  sensors.begin();/* Inizialisieren der Dallas Temperature library */
-//  sensors.setResolution(TEMP_10_BIT); // Genauigkeit auf 12-Bit setzen
-  sensors.requestTemperatures(); // Temp abfragen
+
 #endif
   // LMIC init
   os_init();
